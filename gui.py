@@ -19,16 +19,18 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 from PIL import Image, ImageTk
 
+import centering
 import diagnostics
 import imaging
 import main as console
+import platesolver
 from alpaca import AlpacaError
-from config import load_config, save_config
+from config import load_config, save_config, validate_settings
 
 GREEN = "#2ecc71"
 RED = "#e74c3c"
@@ -86,6 +88,14 @@ class App:
 
         self.ui_queue = queue.Queue()
 
+        # Camera-selection combos (Settings + Telescope tabs) share one
+        # discovered-name list so both always show the same options.
+        self._camera_combo_widgets = []  # [(combo_widget, its_StringVar), ...]
+        self._camera_options = []
+        self._camera_label_to_number = {}
+
+        self._sc_abort_event = None  # set while a Slew & Center run is active
+
         self._build_ui()
         self._start_worker()
         self.root.after(80, self._pump)
@@ -126,6 +136,7 @@ class App:
         self.tab_focuser = ttk.Frame(notebook, padding=8)
         self.tab_filterwheel = ttk.Frame(notebook, padding=8)
         self.tab_switch = ttk.Frame(notebook, padding=8)
+        self.tab_settings = ttk.Frame(notebook, padding=8)
         self.tab_diagnostics = ttk.Frame(notebook, padding=8)
 
         notebook.add(self.tab_telescope, text="Telescope")
@@ -133,13 +144,15 @@ class App:
         notebook.add(self.tab_focuser, text="Focuser")
         notebook.add(self.tab_filterwheel, text="Filter Wheel")
         notebook.add(self.tab_switch, text="Switch")
+        notebook.add(self.tab_settings, text="Settings")
         notebook.add(self.tab_diagnostics, text="Diagnostics / Raw")
 
-        self._build_telescope_tab()
         self._build_camera_tab()
+        self._build_telescope_tab()
         self._build_focuser_tab()
         self._build_filterwheel_tab()
         self._build_switch_tab()
+        self._build_settings_tab()
         self._build_diagnostics_tab()
 
         log_toolbar = ttk.Frame(log_frame)
@@ -231,6 +244,49 @@ class App:
         ttk.Button(axis_box, text="Pulse 0.5s",
                    command=self.on_axis_pulse).grid(row=0, column=5, padx=4)
 
+        sc_box = ttk.LabelFrame(f, text="Slew & Center (plate-solve loop)", padding=6)
+        sc_box.pack(fill="x", pady=4)
+        ttk.Label(sc_box, foreground="#888",
+                  text="Uses the Target/RA/Dec fields above. Defaults come from Settings; "
+                       "changes here are a one-off override for this run only."
+                  ).grid(row=0, column=0, columnspan=4, sticky="w")
+
+        ttk.Label(sc_box, text="Camera:").grid(row=1, column=0, sticky="e")
+        self.sc_camera_var = tk.StringVar()
+        self.sc_camera_combo = ttk.Combobox(sc_box, textvariable=self.sc_camera_var,
+                                             state="readonly", width=32)
+        self.sc_camera_combo.grid(row=1, column=1, sticky="w", padx=4)
+        self._camera_combo_widgets.append((self.sc_camera_combo, self.sc_camera_var))
+
+        ttk.Label(sc_box, text="Exposure (s):").grid(row=1, column=2, sticky="e")
+        self.sc_exposure_var = tk.StringVar()
+        ttk.Entry(sc_box, textvariable=self.sc_exposure_var, width=8).grid(
+            row=1, column=3, sticky="w", padx=4)
+
+        ttk.Label(sc_box, text="Tolerance (arcmin):").grid(row=2, column=0, sticky="e")
+        self.sc_tolerance_var = tk.StringVar()
+        ttk.Entry(sc_box, textvariable=self.sc_tolerance_var, width=8).grid(
+            row=2, column=1, sticky="w", padx=4)
+        ttk.Label(sc_box, text="Iterations:").grid(row=2, column=2, sticky="e")
+        self.sc_iterations_var = tk.StringVar()
+        ttk.Entry(sc_box, textvariable=self.sc_iterations_var, width=8).grid(
+            row=2, column=3, sticky="w", padx=4)
+
+        sc_btn_row = ttk.Frame(sc_box)
+        sc_btn_row.grid(row=3, column=0, columnspan=4, pady=6, sticky="w")
+        ttk.Button(sc_btn_row, text="Slew & Center", command=self.on_slew_and_center).pack(side="left")
+        ttk.Button(sc_btn_row, text="Abort", command=self.on_slew_and_center_abort).pack(
+            side="left", padx=4)
+
+        progress_box = ttk.LabelFrame(f, text="Slew & Center Progress", padding=6)
+        progress_box.pack(fill="x", pady=4)
+        self.sc_progress_vars = {}
+        for i, label in enumerate(["Iteration", "Target", "Solved", "Pointing error", "Status"]):
+            ttk.Label(progress_box, text=label + ":").grid(row=i, column=0, sticky="e", pady=1)
+            var = tk.StringVar(value="-")
+            self.sc_progress_vars[label] = var
+            ttk.Label(progress_box, textvariable=var).grid(row=i, column=1, sticky="w", padx=4)
+
     def _on_target_selected(self, _event):
         name = self.target_var.get()
         if name in console.CATALOG:
@@ -311,6 +367,108 @@ class App:
         self.switch_rows_frame = ttk.Frame(f)
         self.switch_rows_frame.pack(fill="x", pady=4)
         self.switch_widgets = {}
+
+    def _build_settings_tab(self):
+        f = self.tab_settings
+
+        conn_box = ttk.LabelFrame(f, text="Connection", padding=6)
+        conn_box.pack(fill="x", pady=4)
+        ttk.Label(conn_box, text="Client ID:").grid(row=0, column=0, sticky="e")
+        self.set_client_id_var = tk.StringVar()
+        ttk.Entry(conn_box, textvariable=self.set_client_id_var, width=10).grid(
+            row=0, column=1, sticky="w", padx=4)
+        ttk.Label(conn_box, text="Discovery timeout (s):").grid(row=0, column=2, sticky="e")
+        self.set_discovery_timeout_var = tk.StringVar()
+        ttk.Entry(conn_box, textvariable=self.set_discovery_timeout_var, width=8).grid(
+            row=0, column=3, sticky="w", padx=4)
+
+        ttk.Label(conn_box, text="Preferred server IP:").grid(row=1, column=0, sticky="e")
+        self.set_pref_ip_var = tk.StringVar()
+        ttk.Entry(conn_box, textvariable=self.set_pref_ip_var, width=16).grid(
+            row=1, column=1, sticky="w", padx=4)
+        ttk.Label(conn_box, text="Preferred server port:").grid(row=1, column=2, sticky="e")
+        self.set_pref_port_var = tk.StringVar()
+        ttk.Entry(conn_box, textvariable=self.set_pref_port_var, width=8).grid(
+            row=1, column=3, sticky="w", padx=4)
+        ttk.Label(conn_box, foreground="#888", wraplength=560, justify="left",
+                  text="Preferred server IP/port are only used as a fallback when Alpaca UDP "
+                       "discovery finds nothing -- normal operation always uses discovery, and "
+                       "the Alpaca port always comes from there, never from this setting."
+                  ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        out_box = ttk.LabelFrame(f, text="Output", padding=6)
+        out_box.pack(fill="x", pady=4)
+        ttk.Label(out_box, text="Image/output folder:").grid(row=0, column=0, sticky="e")
+        ttk.Entry(out_box, textvariable=self.output_dir_var, width=55).grid(
+            row=0, column=1, sticky="we", padx=4)
+        ttk.Button(out_box, text="Browse...", command=self.on_browse_output_dir).grid(row=0, column=2)
+        out_box.columnconfigure(1, weight=1)
+
+        solve_box = ttk.LabelFrame(f, text="Plate Solving", padding=6)
+        solve_box.pack(fill="x", pady=4)
+        ttk.Label(solve_box, text="ASTAP executable:").grid(row=0, column=0, sticky="e")
+        self.astap_path_var = tk.StringVar()
+        ttk.Entry(solve_box, textvariable=self.astap_path_var, width=55).grid(
+            row=0, column=1, sticky="we", padx=4)
+        ttk.Button(solve_box, text="Browse...", command=self.on_astap_browse).grid(row=0, column=2)
+        solve_box.columnconfigure(1, weight=1)
+
+        self.astap_status_var = tk.StringVar(value="(not checked yet)")
+        ttk.Label(solve_box, textvariable=self.astap_status_var).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        solve_btn_row = ttk.Frame(solve_box)
+        solve_btn_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=4)
+        ttk.Button(solve_btn_row, text="Detect Automatically",
+                   command=self.on_astap_detect).pack(side="left")
+        ttk.Button(solve_btn_row, text="Test ASTAP", command=self.on_astap_test).pack(
+            side="left", padx=4)
+
+        ttk.Label(solve_box, text="Plate solve timeout (s):").grid(row=3, column=0, sticky="e")
+        self.plate_solve_timeout_var = tk.StringVar()
+        ttk.Entry(solve_box, textvariable=self.plate_solve_timeout_var, width=8).grid(
+            row=3, column=1, sticky="w", padx=4)
+
+        center_box = ttk.LabelFrame(f, text="Slew & Center defaults", padding=6)
+        center_box.pack(fill="x", pady=4)
+        ttk.Label(center_box, text="Centering camera:").grid(row=0, column=0, sticky="e")
+        self.centering_camera_var = tk.StringVar()
+        self.centering_camera_combo = ttk.Combobox(
+            center_box, textvariable=self.centering_camera_var, state="readonly", width=34)
+        self.centering_camera_combo.grid(row=0, column=1, sticky="w", padx=4)
+        self._camera_combo_widgets.append((self.centering_camera_combo, self.centering_camera_var))
+
+        ttk.Label(center_box, text="Exposure (s):").grid(row=0, column=2, sticky="e")
+        self.centering_exposure_var = tk.StringVar()
+        ttk.Entry(center_box, textvariable=self.centering_exposure_var, width=8).grid(
+            row=0, column=3, sticky="w", padx=4)
+
+        ttk.Label(center_box, text="Tolerance (arcmin):").grid(row=1, column=0, sticky="e")
+        self.centering_tolerance_var = tk.StringVar()
+        ttk.Entry(center_box, textvariable=self.centering_tolerance_var, width=8).grid(
+            row=1, column=1, sticky="w", padx=4)
+        ttk.Label(center_box, text="Max iterations:").grid(row=1, column=2, sticky="e")
+        self.centering_iterations_var = tk.StringVar()
+        ttk.Entry(center_box, textvariable=self.centering_iterations_var, width=8).grid(
+            row=1, column=3, sticky="w", padx=4)
+
+        ttk.Label(center_box, text="Minimum altitude (deg):").grid(row=2, column=0, sticky="e")
+        self.min_altitude_var = tk.StringVar()
+        ttk.Entry(center_box, textvariable=self.min_altitude_var, width=8).grid(
+            row=2, column=1, sticky="w", padx=4)
+        ttk.Label(center_box, text="Sun exclusion radius (deg):").grid(row=2, column=2, sticky="e")
+        self.sun_exclusion_var = tk.StringVar()
+        ttk.Entry(center_box, textvariable=self.sun_exclusion_var, width=8).grid(
+            row=2, column=3, sticky="w", padx=4)
+
+        save_row = ttk.Frame(f)
+        save_row.pack(fill="x", pady=8)
+        ttk.Button(save_row, text="Save Settings", command=self.on_settings_save).pack(side="left")
+        ttk.Button(save_row, text="Reload", command=self.on_settings_reload).pack(side="left", padx=4)
+        self.settings_status_var = tk.StringVar(value="")
+        ttk.Label(save_row, textvariable=self.settings_status_var).pack(side="left", padx=8)
+
+        self._populate_settings_widgets()
 
     def _build_diagnostics_tab(self):
         f = self.tab_diagnostics
@@ -439,6 +597,36 @@ class App:
             light.pack(side="left")
             self.status_lights[key] = light
 
+    def _update_camera_options(self):
+        """Refreshes every registered camera combo (Settings + Telescope
+        tabs) with real discovered camera names, e.g.
+        'Camera 1 -- Seestar S30 Pro Wide Angle Camera' instead of a bare
+        number. Falls back to just the configured number if nothing has
+        been discovered yet."""
+        cams = sorted(self.state.by_type("camera"), key=lambda c: c.device_number)
+        if cams:
+            self._camera_options = [f"Camera {c.device_number} -- {c.display_name()}" for c in cams]
+            self._camera_label_to_number = {
+                label: c.device_number for label, c in zip(self._camera_options, cams)
+            }
+        else:
+            n = self.cfg.get("centering_camera", 0)
+            self._camera_options = [f"Camera {n}"]
+            self._camera_label_to_number = {self._camera_options[0]: n}
+
+        wanted = self.cfg.get("centering_camera", 0)
+        preferred_label = next(
+            (lbl for lbl, num in self._camera_label_to_number.items() if num == wanted),
+            self._camera_options[0])
+
+        for combo, var in self._camera_combo_widgets:
+            combo["values"] = self._camera_options
+            if var.get() not in self._camera_options:
+                var.set(preferred_label)
+
+    def _parse_camera_number(self, label):
+        return self._camera_label_to_number.get(label, self.cfg.get("centering_camera", 0))
+
     # ------------------------------------------------------------------
     # Top bar handlers
     # ------------------------------------------------------------------
@@ -451,6 +639,7 @@ class App:
 
     def _after_discover(self):
         self._rebuild_status_lights()
+        self._update_camera_options()
         if self.state.server:
             self.server_label.configure(
                 text=f"Server: {self.state.server.ip}:{self.state.server.port}  "
@@ -866,6 +1055,214 @@ class App:
                 return
             diagnostics.report_action(sw, "SetSwitch", lambda: sw.set_switch(idx, on))
         self.submit(task)
+
+    # ------------------------------------------------------------------
+    # Settings handlers
+    # ------------------------------------------------------------------
+
+    def _populate_settings_widgets(self):
+        c = self.cfg
+        self.set_client_id_var.set(str(c.get("client_id", 1234)))
+        self.set_discovery_timeout_var.set(str(c.get("discovery_timeout", 3)))
+        self.set_pref_ip_var.set(c.get("preferred_server_ip") or "")
+        self.set_pref_port_var.set(
+            str(c.get("preferred_server_port")) if c.get("preferred_server_port") else "")
+        self.astap_path_var.set(c.get("astap_path", ""))
+        self.plate_solve_timeout_var.set(str(c.get("plate_solve_timeout", 60)))
+        self.centering_tolerance_var.set(str(c.get("centering_tolerance_arcmin", 5.0)))
+        self.centering_iterations_var.set(str(c.get("centering_max_iterations", 3)))
+        self.centering_exposure_var.set(str(c.get("centering_exposure_seconds", 2.0)))
+        self.min_altitude_var.set(str(c.get("minimum_target_altitude_deg", 20.0)))
+        self.sun_exclusion_var.set(str(c.get("sun_exclusion_deg", 30.0)))
+        # Telescope tab's Slew & Center per-run fields start out matching
+        # the persisted defaults too.
+        self.sc_exposure_var.set(str(c.get("centering_exposure_seconds", 2.0)))
+        self.sc_tolerance_var.set(str(c.get("centering_tolerance_arcmin", 5.0)))
+        self.sc_iterations_var.set(str(c.get("centering_max_iterations", 3)))
+        self._update_camera_options()
+        if not self.astap_path_var.get():
+            self.astap_status_var.set("(not configured -- Browse or Detect Automatically)")
+
+    def on_settings_save(self):
+        raw = {
+            "client_id": self.set_client_id_var.get().strip(),
+            "discovery_timeout": self.set_discovery_timeout_var.get().strip(),
+            "preferred_server_ip": self.set_pref_ip_var.get().strip(),
+            "preferred_server_port": self.set_pref_port_var.get().strip(),
+            "output_directory": self.output_dir_var.get().strip(),
+            "astap_path": self.astap_path_var.get().strip(),
+            "plate_solve_timeout": self.plate_solve_timeout_var.get().strip(),
+            "centering_tolerance_arcmin": self.centering_tolerance_var.get().strip(),
+            "centering_max_iterations": self.centering_iterations_var.get().strip(),
+            "centering_exposure_seconds": self.centering_exposure_var.get().strip(),
+            "centering_camera": str(self._parse_camera_number(self.centering_camera_var.get())),
+            "minimum_target_altitude_deg": self.min_altitude_var.get().strip(),
+            "sun_exclusion_deg": self.sun_exclusion_var.get().strip(),
+        }
+        ok, errors, parsed = validate_settings(raw)
+        if not ok:
+            message = "Settings NOT saved -- fix these first:\n\n" + "\n".join(errors)
+            self.settings_status_var.set("Save FAILED -- see error dialog")
+            messagebox.showerror("Invalid settings", message)
+            return
+
+        # self.cfg IS self.state.cfg (same dict object, set up in __init__),
+        # so this single update() already takes effect for both -- and for
+        # anything that reads state.cfg fresh at point of use (output
+        # folder, ASTAP path, Slew & Center defaults) with no restart
+        # needed. client_id/discovery_timeout only affect the NEXT
+        # Discover, since already-connected device objects keep the
+        # client_id they were constructed with.
+        self.cfg.update(parsed)
+        try:
+            save_config(self.cfg)
+        except OSError as e:
+            self.settings_status_var.set(f"Save FAILED: {e}")
+            return
+
+        self.settings_status_var.set("Settings saved.")
+        self.submit(lambda: print("Settings saved to config.json."))
+
+    def on_settings_reload(self):
+        self.cfg.clear()
+        self.cfg.update(load_config())
+        self._populate_settings_widgets()
+        self.settings_status_var.set("Reloaded from config.json.")
+
+    def on_astap_browse(self):
+        current = self.astap_path_var.get().strip()
+        chosen = filedialog.askopenfilename(
+            title="Choose the ASTAP executable",
+            initialdir=os.path.dirname(current) if current else "C:\\",
+            filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
+        if chosen:
+            self.astap_path_var.set(chosen)
+            self.astap_status_var.set("(not tested yet -- click Test ASTAP)")
+
+    def on_astap_detect(self):
+        def task():
+            found = platesolver.find_astap()
+            print(f"ASTAP detected: {found}" if found else
+                  "No ASTAP installation found on PATH or in common install locations.")
+            self.ui(lambda: self._apply_astap_detected(found))
+        self.submit(task)
+
+    def _apply_astap_detected(self, found):
+        if not found:
+            self.astap_status_var.set("Not found automatically -- Browse for it manually.")
+            return
+        current = self.astap_path_var.get().strip()
+        if current and os.path.normcase(current) == os.path.normcase(found):
+            self.astap_status_var.set(f"Detected (already set): {found}")
+            return
+        # Never overwrite a saved path silently -- ask first.
+        if messagebox.askyesno("ASTAP detected", f"Found ASTAP at:\n{found}\n\nUse this path?"):
+            self.astap_path_var.set(found)
+            self.astap_status_var.set(f"Using detected path: {found}")
+        else:
+            self.astap_status_var.set(f"Detected but not applied: {found}")
+
+    def on_astap_test(self):
+        path = self.astap_path_var.get().strip()
+
+        def task():
+            result = platesolver.test_astap(path)
+            if result["ok"]:
+                print(f"ASTAP executable: OK\nPath: {path}\n"
+                      f"Version: {result.get('version') or '(unknown)'}")
+            else:
+                print(f"ASTAP test FAILED:\n{result['message']}")
+            self.ui(lambda: self._apply_astap_test_result(result, path))
+        self.submit(task)
+
+    def _apply_astap_test_result(self, result, path):
+        if result["ok"]:
+            ver = result.get("version") or "unknown version"
+            self.astap_status_var.set(f"\u2713 OK -- {ver}  ({path})")
+        else:
+            self.astap_status_var.set(f"\u2717 FAILED: {result['message']}")
+
+    # ------------------------------------------------------------------
+    # Slew & Center
+    # ------------------------------------------------------------------
+
+    def on_slew_and_center(self):
+        ra_raw, dec_raw = self.ra_var.get().strip(), self.dec_var.get().strip()
+        target_name = self.target_var.get()
+
+        try:
+            camera_number = self._parse_camera_number(self.sc_camera_var.get())
+            exposure = float(self.sc_exposure_var.get())
+            tolerance = float(self.sc_tolerance_var.get())
+            iterations = int(self.sc_iterations_var.get())
+        except ValueError:
+            self.submit(lambda: print("Invalid Slew & Center parameter "
+                                       "(exposure/tolerance/iterations)."))
+            return
+
+        if target_name in console.CATALOG:
+            ra, dec = console.CATALOG[target_name]
+        elif ra_raw and dec_raw:
+            try:
+                ra, dec = float(ra_raw), float(dec_raw)
+            except ValueError:
+                self.submit(lambda: print("Invalid RA/Dec for Slew & Center."))
+                return
+        else:
+            self.submit(lambda: print(
+                "Pick a catalog target or enter RA/Dec before running Slew & Center."))
+            return
+
+        astap_path = self.cfg.get("astap_path", "")
+        plate_solve_timeout = self.cfg.get("plate_solve_timeout", 60)
+        min_alt = self.cfg.get("minimum_target_altitude_deg", 20.0)
+        sun_excl = self.cfg.get("sun_exclusion_deg", 30.0)
+        out_dir = self.output_dir_var.get().strip() or None
+
+        self._sc_abort_event = threading.Event()
+        abort_event = self._sc_abort_event
+
+        def progress(payload):
+            self.ui(lambda: self._apply_centering_progress(payload))
+
+        def task():
+            result = centering.slew_and_center(
+                self.state, ra, dec, camera_number, exposure, tolerance, iterations,
+                astap_path, plate_solve_timeout=plate_solve_timeout,
+                min_altitude_deg=min_alt, sun_exclusion_deg=sun_excl,
+                output_dir=out_dir, progress_cb=progress, abort_event=abort_event,
+            )
+            print(f"\nSlew & Center finished: {'SUCCESS' if result['success'] else 'DID NOT COMPLETE'}")
+            print(result["message"])
+        self.submit(task)
+
+    def on_slew_and_center_abort(self):
+        if self._sc_abort_event is not None and not self._sc_abort_event.is_set():
+            self._sc_abort_event.set()
+            self.log_queue.put("Abort requested -- will stop at the next safe checkpoint.")
+        else:
+            self.log_queue.put("No Slew & Center run in progress.")
+
+    def _apply_centering_progress(self, payload):
+        status = payload.get("status", "")
+        if "iteration" in payload:
+            self.sc_progress_vars["Iteration"].set(
+                f"{payload['iteration']}/{payload.get('max_iterations', self.sc_iterations_var.get())}")
+        if "target_ra" in payload and "target_dec" in payload:
+            self.sc_progress_vars["Target"].set(
+                f"{payload['target_ra']:.4f}h  {payload['target_dec']:.3f}deg")
+        if "solved_ra" in payload and "solved_dec" in payload:
+            self.sc_progress_vars["Solved"].set(
+                f"{payload['solved_ra']:.4f}h  {payload['solved_dec']:.3f}deg")
+        if "error_arcmin" in payload:
+            self.sc_progress_vars["Pointing error"].set(f"{payload['error_arcmin']:.2f} arcmin")
+        status_labels = {
+            "slewing": "SLEWING", "iteration_start": "SOLVING", "solved": "SOLVED",
+            "centered": "CENTERED", "max_iterations": "NOT CENTERED (max iterations)",
+            "error": "ERROR", "rejected": "REJECTED (safety)", "solve_failed": "SOLVE FAILED",
+            "sync": "SYNCING", "aborted": "ABORTED",
+        }
+        self.sc_progress_vars["Status"].set(status_labels.get(status, status.upper()))
 
     # ------------------------------------------------------------------
     # Diagnostics handlers

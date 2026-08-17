@@ -109,6 +109,63 @@ def write_fits(path, array, header_items=None):
         f.write(data_bytes)
 
 
+def _format_ra_sexagesimal(hours):
+    h = int(hours)
+    m_full = (hours - h) * 60
+    m = int(m_full)
+    s = (m_full - m) * 60
+    return f"{h:02d} {m:02d} {s:05.2f}"
+
+
+def _format_dec_sexagesimal(deg):
+    sign = "-" if deg < 0 else "+"
+    deg = abs(deg)
+    d = int(deg)
+    m_full = (deg - d) * 60
+    m = int(m_full)
+    s = (m_full - m) * 60
+    return f"{sign}{d:02d} {m:02d} {s:04.1f}"
+
+
+def build_fits_header_items(camera, telescope=None, exposure_seconds=None,
+                             ra_hours=None, dec_deg=None):
+    """Builds the (key, value, comment) list write_fits() expects, from
+    whatever real values are actually available -- never invents a value
+    for something that couldn't be read. `telescope` and ra_hours/dec_deg
+    are optional (e.g. a bare capability check has no telescope handy)."""
+    items = []
+    if exposure_seconds is not None:
+        items.append(("EXPTIME", float(exposure_seconds), "exposure time in seconds"))
+    items.append(("DATE-OBS", time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                  "UTC date/time of file write (approx)"))
+    try:
+        items.append(("INSTRUME", camera.display_name(), "camera device name"))
+    except Exception:
+        pass
+    items.append(("TELESCOP", "Seestar S30 Pro", "telescope model"))
+
+    if ra_hours is not None:
+        items.append(("RA", float(ra_hours) * 15.0, "telescope-reported RA, deg"))
+        items.append(("OBJCTRA", _format_ra_sexagesimal(float(ra_hours)),
+                      "telescope-reported RA, sexagesimal"))
+    if dec_deg is not None:
+        items.append(("DEC", float(dec_deg), "telescope-reported Dec, deg"))
+        items.append(("OBJCTDEC", _format_dec_sexagesimal(float(dec_deg)),
+                      "telescope-reported Dec, sexagesimal"))
+
+    if telescope is not None:
+        try:
+            items.append(("SITELAT", float(telescope.get("sitelatitude")), "site latitude, deg"))
+        except Exception:
+            pass
+        try:
+            items.append(("SITELONG", float(telescope.get("sitelongitude")), "site longitude, deg"))
+        except Exception:
+            pass
+
+    return items
+
+
 # ---------------------------------------------------------------------------
 # PNG preview (quick look only)
 # ---------------------------------------------------------------------------

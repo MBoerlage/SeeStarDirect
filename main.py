@@ -26,8 +26,11 @@ from datetime import datetime
 
 import numpy as np
 
+import centering
+import daylight_capability_test
 import diagnostics
 import imaging
+import platesolver
 from alpaca import AlpacaError, AlpacaServer, discover_servers
 from config import load_config, save_config
 
@@ -450,6 +453,92 @@ def camera_save_last(state):
 
 
 # ---------------------------------------------------------------------------
+# Slew & Center (native Alpaca + ASTAP) -- same backend as gui.py, no
+# Tkinter here. See centering.py for the actual workflow.
+# ---------------------------------------------------------------------------
+
+def telescope_slew_and_center(state):
+    t = state.pick("telescope", "telescope")
+    if not t:
+        return
+    cams = state.by_type("camera")
+    if not cams:
+        print("No cameras known -- run Discover first.")
+        return
+
+    print("Available cameras:")
+    for c in cams:
+        print(f"  {c.device_number}: {c.display_name()}")
+    default_cam = state.cfg.get("centering_camera", 0)
+    cam_str = input(f"Camera number [{default_cam}]: ").strip()
+    try:
+        camera_number = int(cam_str) if cam_str else default_cam
+    except ValueError:
+        print("Invalid camera number.")
+        return
+
+    print("\nKnown targets: " + ", ".join(sorted(CATALOG.keys())))
+    raw = input("Target name, or 'RA,Dec' in decimal hours,degrees: ").strip()
+    if not raw:
+        print("Cancelled.")
+        return
+    key = raw.lower()
+    if key in CATALOG:
+        ra, dec = CATALOG[key]
+    else:
+        try:
+            ra_s, dec_s = raw.split(",")
+            ra, dec = float(ra_s), float(dec_s)
+        except ValueError:
+            print("Could not parse target. Use a catalog name or 'RA,Dec', e.g. '5.59,-5.39'.")
+            return
+
+    def ask_float(prompt, default):
+        s = input(f"{prompt} [{default}]: ").strip()
+        if not s:
+            return default
+        try:
+            return float(s)
+        except ValueError:
+            print("Invalid number, using default.")
+            return default
+
+    exposure = ask_float("Exposure seconds", state.cfg.get("centering_exposure_seconds", 2.0))
+    tolerance = ask_float("Tolerance (arcmin)", state.cfg.get("centering_tolerance_arcmin", 5.0))
+    iterations_default = state.cfg.get("centering_max_iterations", 3)
+    iterations_s = input(f"Max iterations [{iterations_default}]: ").strip()
+    try:
+        iterations = int(iterations_s) if iterations_s else iterations_default
+    except ValueError:
+        print("Invalid number, using default.")
+        iterations = iterations_default
+
+    astap_path = state.cfg.get("astap_path", "")
+    if not platesolver.is_valid_astap_path(astap_path):
+        detected = platesolver.find_astap()
+        if detected:
+            use = input(f"ASTAP not configured. Detected at {detected} -- "
+                        f"use it for this run only? [y/N]: ").strip().lower()
+            if use == "y":
+                astap_path = detected
+    if not platesolver.is_valid_astap_path(astap_path):
+        print("No valid ASTAP executable configured -- set 'astap_path' in config.json "
+              "(or the GUI's Settings tab) first.")
+        return
+
+    out_dir = os.path.join(SCRIPT_DIR, state.cfg.get("output_directory", "images"))
+    result = centering.slew_and_center(
+        state, ra, dec, camera_number, exposure, tolerance, iterations,
+        astap_path, plate_solve_timeout=state.cfg.get("plate_solve_timeout", 60),
+        min_altitude_deg=state.cfg.get("minimum_target_altitude_deg", 20.0),
+        sun_exclusion_deg=state.cfg.get("sun_exclusion_deg", 30.0),
+        output_dir=out_dir,
+    )
+    print(f"\nSlew & Center finished: {'SUCCESS' if result['success'] else 'DID NOT COMPLETE'}")
+    print(result["message"])
+
+
+# ---------------------------------------------------------------------------
 # Focuser menu
 # ---------------------------------------------------------------------------
 
@@ -711,6 +800,16 @@ SWITCH
 50. Show switches
 51. Set switch
 
+SLEW & CENTER
+60. Slew & Center (native Alpaca SlewToCoordinatesAsync + ASTAP plate
+    solve + Sync/corrected reslew loop -- see Settings/config.json for
+    defaults: astap_path, centering_*, minimum_target_altitude_deg,
+    sun_exclusion_deg)
+
+DAYLIGHT TEST
+80. Daylight Alpaca / NINA Compatibility Test (safe: no exposure, no slew,
+    no arm movement unless you explicitly confirm)
+
 DIAGNOSTICS
 90. Show SupportedActions
 91. Dump Alpaca device information
@@ -748,6 +847,8 @@ HANDLERS = {
     "41": filterwheel_select,
     "50": switch_show,
     "51": switch_set,
+    "60": telescope_slew_and_center,
+    "80": daylight_capability_test.run_daylight_capability_test,
     "90": show_supported_actions,
     "91": dump_device_info,
     "92": raw_get,
