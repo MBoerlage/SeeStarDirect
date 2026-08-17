@@ -13,5 +13,8 @@
   "centering_exposure_seconds": 2.0,
   "centering_camera": 0,
   "minimum_target_altitude_deg": 20.0,
-  "sun_exclusion_deg": 30.0
+  "sun_exclusion_deg": 30.0,
+
+  "fallback_latitude": null,
+  "fallback_longitude": null
 }

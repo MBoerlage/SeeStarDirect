@@ -104,6 +104,43 @@ class App:
     # Layout
     # ------------------------------------------------------------------
 
+    def _make_scrollable_tab(self, notebook, title):
+        """Adds a new notebook tab whose content scrolls (mouse wheel while
+        hovered, or the scrollbar) instead of being silently clipped when a
+        tab needs more vertical space than the window currently has --
+        confirmed necessary: Telescope (with Slew & Center) needs ~780px
+        and Settings ~580px, both taller than fits at the app's minimum
+        window size. Returns the inner Frame to build tab content into,
+        same as a plain ttk.Frame would be used."""
+        outer = ttk.Frame(notebook)
+        notebook.add(outer, text=title)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        inner = ttk.Frame(canvas, padding=8)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def on_inner_configure(_event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def on_canvas_configure(event):
+            canvas.itemconfig(window_id, width=event.width)
+
+        inner.bind("<Configure>", on_inner_configure)
+        canvas.bind("<Configure>", on_canvas_configure)
+
+        def on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        return inner
+
     def _build_ui(self):
         top = ttk.Frame(self.root, padding=8)
         top.pack(side="top", fill="x")
@@ -131,21 +168,18 @@ class App:
         notebook = ttk.Notebook(notebook_holder)
         notebook.pack(fill="both", expand=True)
 
-        self.tab_telescope = ttk.Frame(notebook, padding=8)
-        self.tab_camera = ttk.Frame(notebook, padding=8)
-        self.tab_focuser = ttk.Frame(notebook, padding=8)
-        self.tab_filterwheel = ttk.Frame(notebook, padding=8)
-        self.tab_switch = ttk.Frame(notebook, padding=8)
-        self.tab_settings = ttk.Frame(notebook, padding=8)
-        self.tab_diagnostics = ttk.Frame(notebook, padding=8)
-
-        notebook.add(self.tab_telescope, text="Telescope")
-        notebook.add(self.tab_camera, text="Camera")
-        notebook.add(self.tab_focuser, text="Focuser")
-        notebook.add(self.tab_filterwheel, text="Filter Wheel")
-        notebook.add(self.tab_switch, text="Switch")
-        notebook.add(self.tab_settings, text="Settings")
-        notebook.add(self.tab_diagnostics, text="Diagnostics / Raw")
+        # Every tab is scrollable (mouse wheel + scrollbar) rather than a
+        # bare Frame -- Telescope (with Slew & Center) and Settings both
+        # need more vertical space than fits at the minimum window size,
+        # and a bare Frame would silently clip controls with no way to
+        # reach them instead of scrolling to them.
+        self.tab_telescope = self._make_scrollable_tab(notebook, "Telescope")
+        self.tab_camera = self._make_scrollable_tab(notebook, "Camera")
+        self.tab_focuser = self._make_scrollable_tab(notebook, "Focuser")
+        self.tab_filterwheel = self._make_scrollable_tab(notebook, "Filter Wheel")
+        self.tab_switch = self._make_scrollable_tab(notebook, "Switch")
+        self.tab_settings = self._make_scrollable_tab(notebook, "Settings")
+        self.tab_diagnostics = self._make_scrollable_tab(notebook, "Diagnostics / Raw")
 
         self._build_camera_tab()
         self._build_telescope_tab()
@@ -460,6 +494,22 @@ class App:
         self.sun_exclusion_var = tk.StringVar()
         ttk.Entry(center_box, textvariable=self.sun_exclusion_var, width=8).grid(
             row=2, column=3, sticky="w", padx=4)
+
+        site_box = ttk.LabelFrame(f, text="Observing Site", padding=6)
+        site_box.pack(fill="x", pady=4)
+        ttk.Label(site_box, foreground="#888", wraplength=560, justify="left",
+                  text="Optional fallback only -- used for the altitude/Sun safety check "
+                       "solely if the telescope's own SiteLatitude/SiteLongitude can't be "
+                       "read. The telescope's live values are always preferred when available."
+                  ).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(site_box, text="Fallback latitude (deg):").grid(row=1, column=0, sticky="e")
+        self.fallback_lat_var = tk.StringVar()
+        ttk.Entry(site_box, textvariable=self.fallback_lat_var, width=10).grid(
+            row=1, column=1, sticky="w", padx=4)
+        ttk.Label(site_box, text="Fallback longitude (deg):").grid(row=1, column=2, sticky="e")
+        self.fallback_lon_var = tk.StringVar()
+        ttk.Entry(site_box, textvariable=self.fallback_lon_var, width=10).grid(
+            row=1, column=3, sticky="w", padx=4)
 
         save_row = ttk.Frame(f)
         save_row.pack(fill="x", pady=8)
@@ -1074,6 +1124,10 @@ class App:
         self.centering_exposure_var.set(str(c.get("centering_exposure_seconds", 2.0)))
         self.min_altitude_var.set(str(c.get("minimum_target_altitude_deg", 20.0)))
         self.sun_exclusion_var.set(str(c.get("sun_exclusion_deg", 30.0)))
+        self.fallback_lat_var.set(
+            str(c.get("fallback_latitude")) if c.get("fallback_latitude") is not None else "")
+        self.fallback_lon_var.set(
+            str(c.get("fallback_longitude")) if c.get("fallback_longitude") is not None else "")
         # Telescope tab's Slew & Center per-run fields start out matching
         # the persisted defaults too.
         self.sc_exposure_var.set(str(c.get("centering_exposure_seconds", 2.0)))
@@ -1098,6 +1152,8 @@ class App:
             "centering_camera": str(self._parse_camera_number(self.centering_camera_var.get())),
             "minimum_target_altitude_deg": self.min_altitude_var.get().strip(),
             "sun_exclusion_deg": self.sun_exclusion_var.get().strip(),
+            "fallback_latitude": self.fallback_lat_var.get().strip(),
+            "fallback_longitude": self.fallback_lon_var.get().strip(),
         }
         ok, errors, parsed = validate_settings(raw)
         if not ok:
@@ -1217,6 +1273,8 @@ class App:
         plate_solve_timeout = self.cfg.get("plate_solve_timeout", 60)
         min_alt = self.cfg.get("minimum_target_altitude_deg", 20.0)
         sun_excl = self.cfg.get("sun_exclusion_deg", 30.0)
+        fallback_lat = self.cfg.get("fallback_latitude")
+        fallback_lon = self.cfg.get("fallback_longitude")
         out_dir = self.output_dir_var.get().strip() or None
 
         self._sc_abort_event = threading.Event()
@@ -1230,6 +1288,7 @@ class App:
                 self.state, ra, dec, camera_number, exposure, tolerance, iterations,
                 astap_path, plate_solve_timeout=plate_solve_timeout,
                 min_altitude_deg=min_alt, sun_exclusion_deg=sun_excl,
+                fallback_lat=fallback_lat, fallback_lon=fallback_lon,
                 output_dir=out_dir, progress_cb=progress, abort_event=abort_event,
             )
             print(f"\nSlew & Center finished: {'SUCCESS' if result['success'] else 'DID NOT COMPLETE'}")

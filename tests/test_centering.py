@@ -153,6 +153,37 @@ def test_safety_surfaces_alpaca_error_reading_state():
     assert ok is False
 
 
+class SiteUnreadableTelescope(FakeTelescope):
+    def get(self, prop, **params):
+        if prop in ("sitelatitude", "sitelongitude"):
+            raise AlpacaError(1024, "not implemented", prop)
+        return super().get(prop, **params)
+
+
+def test_safety_uses_fallback_site_when_telescope_site_unreadable():
+    t = SiteUnreadableTelescope()
+    ok, reason = centering.check_target_safety(t, *SAFE_TARGET, 20.0, 30.0,
+                                                 fallback_lat=30.0, fallback_lon=-95.7)
+    assert ok is True
+
+
+def test_safety_fails_when_site_unreadable_and_no_fallback_configured():
+    t = SiteUnreadableTelescope()
+    ok, reason = centering.check_target_safety(t, *SAFE_TARGET, 20.0, 30.0)
+    assert ok is False
+    assert "fallback" in reason.lower()
+
+
+def test_safety_prefers_live_telescope_site_over_fallback():
+    """The fallback must never override a working live reading -- pass an
+    absurd fallback and confirm the real (working) site value is what
+    actually gets used."""
+    t = FakeTelescope(lat=30.0, lon=-95.7)  # real site: target is safe
+    ok, reason = centering.check_target_safety(
+        t, *SAFE_TARGET, 20.0, 30.0, fallback_lat=-89.0, fallback_lon=0.0)
+    assert ok is True  # would very likely fail if the fallback were used instead
+
+
 # ---------------------------------------------------------------------------
 # slew_and_center -- pre-flight checks (no imaging/platesolver involved)
 # ---------------------------------------------------------------------------

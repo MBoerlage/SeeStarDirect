@@ -6,15 +6,15 @@ No bridge, no proxy, no port-4700 proprietary protocol, no COM driver, no
 NINA. NINA (or this program) are just Alpaca clients talking to the same
 server.
 
-KNOWN FIRMWARE QUIRK (confirmed live, 2026-08-17, Alpaca/driver version
-1.1.1-1 -- ZWO says fixed in 1.1.3-1): after a power cycle, the arm/motor
-subsystem does not respond to native Alpaca commands (Unpark/FindHome/
-MoveAxis/SlewToCoordinatesAsync all report success and update self-
-consistent coordinates, but nothing physically moves) until the official
-Seestar mobile app has connected once. Once the app has connected and the
-arm has risen, it can be closed -- native Alpaca then drives the telescope
-normally for the rest of that power cycle. This is a one-time-per-power-
-cycle step, not an ongoing dependency; see diagnostics.py / README.md.
+HISTORICAL FIRMWARE NOTE: on Alpaca/driver version 1.1.1-1 (confirmed live,
+2026-08-17), the arm/motor subsystem did not respond to native Alpaca
+commands after a power cycle until the official Seestar mobile app had
+connected once -- ZWO said this was fixed in 1.1.3-1. CONFIRMED RESOLVED:
+after updating to 1.2.0-3, a genuine cold-boot test (power on, app never
+opened) showed the arm responding to native Alpaca alone. See
+diagnostics.py / README.md for the full history. print_software_info()
+still checks the live driver version and warns automatically if it's older
+than 1.1.3-1, in case a unit ships on old firmware in the future.
 
 Run: python main.py   (or double-click run.bat)
 """
@@ -147,12 +147,11 @@ def do_discover(state):
     telescopes = state.by_type("telescope")
     if telescopes:
         print()
+        # print_software_info() already checks the live driver version and
+        # prints the app-wake-workaround warning ONLY if it's older than
+        # 1.1.3-1 -- confirmed unnecessary on 1.2.0-3 via a genuine
+        # cold-boot (no app) test, so nothing else needs to print here.
         state.software_info = diagnostics.print_software_info(server, telescopes[0])
-        print("\nREMINDER: on this firmware, the arm/motors will not respond to Alpaca")
-        print("commands after a fresh power-cycle until the official Seestar app has")
-        print("connected once (confirmed workaround for the known 1.1.1-1 bug). If you")
-        print("haven't opened the app since the last power-on, do that first, then close")
-        print("it -- native Alpaca control (menu 12/18/etc.) should then work normally.")
 
 
 def do_show_server_info(state):
@@ -532,6 +531,8 @@ def telescope_slew_and_center(state):
         astap_path, plate_solve_timeout=state.cfg.get("plate_solve_timeout", 60),
         min_altitude_deg=state.cfg.get("minimum_target_altitude_deg", 20.0),
         sun_exclusion_deg=state.cfg.get("sun_exclusion_deg", 30.0),
+        fallback_lat=state.cfg.get("fallback_latitude"),
+        fallback_lon=state.cfg.get("fallback_longitude"),
         output_dir=out_dir,
     )
     print(f"\nSlew & Center finished: {'SUCCESS' if result['success'] else 'DID NOT COMPLETE'}")

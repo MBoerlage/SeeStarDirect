@@ -32,6 +32,11 @@ DEFAULT_CONFIG = {
     "centering_camera": 0,
     "minimum_target_altitude_deg": 20.0,
     "sun_exclusion_deg": 30.0,
+    # Observing site fallback -- only used by safety checks (altitude/Sun
+    # exclusion) if the telescope's own SiteLatitude/SiteLongitude can't be
+    # read. The telescope's live values are always preferred when available.
+    "fallback_latitude": None,
+    "fallback_longitude": None,
 }
 
 
@@ -191,5 +196,25 @@ def validate_settings(raw):
                        min_value=0, max_value=180)
         if v is not None:
             parsed["sun_exclusion_deg"] = v
+
+    if "fallback_latitude" in raw:
+        val = raw["fallback_latitude"]
+        val = val.strip() if isinstance(val, str) else val
+        if val in (None, ""):
+            parsed["fallback_latitude"] = None
+        else:
+            v = _to_float("fallback_latitude", val, errors, min_value=-90, max_value=90)
+            if v is not None:
+                parsed["fallback_latitude"] = v
+
+    if "fallback_longitude" in raw:
+        val = raw["fallback_longitude"]
+        val = val.strip() if isinstance(val, str) else val
+        if val in (None, ""):
+            parsed["fallback_longitude"] = None
+        else:
+            v = _to_float("fallback_longitude", val, errors, min_value=-180, max_value=180)
+            if v is not None:
+                parsed["fallback_longitude"] = v
 
     return (len(errors) == 0, errors, parsed)

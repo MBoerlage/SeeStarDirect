@@ -52,19 +52,31 @@ def angular_separation_deg(ra1_hours, dec1_deg, ra2_hours, dec2_deg):
     return math.degrees(math.acos(cos_d))
 
 
-def check_target_safety(telescope, ra_hours, dec_deg, min_altitude_deg, sun_exclusion_deg):
-    """Returns (ok: bool, reason: str). Uses the TELESCOPE's own UTC/site
-    (not the laptop's) so the check matches what the mount will actually
-    see when it slews there."""
+def check_target_safety(telescope, ra_hours, dec_deg, min_altitude_deg, sun_exclusion_deg,
+                         fallback_lat=None, fallback_lon=None):
+    """Returns (ok: bool, reason: str). Prefers the TELESCOPE's own live
+    UTC/site (not the laptop's) so the check matches what the mount will
+    actually see when it slews there. fallback_lat/fallback_lon (from
+    Settings' Observing Site section) are used ONLY if the telescope's own
+    SiteLatitude/SiteLongitude can't be read -- they never override a
+    working live reading."""
     if not _HAVE_ASTROPY:
         return False, "astropy is not installed -- cannot verify altitude/Sun safety"
 
     try:
         utc_raw = telescope.get("utcdate")
+    except AlpacaError as e:
+        return False, f"Could not read UTC from telescope: {e}"
+
+    try:
         lat = telescope.get("sitelatitude")
         lon = telescope.get("sitelongitude")
     except AlpacaError as e:
-        return False, f"Could not read UTC/site from telescope: {e}"
+        if fallback_lat is not None and fallback_lon is not None:
+            lat, lon = fallback_lat, fallback_lon
+        else:
+            return False, (f"Could not read site location from telescope ({e}), and no "
+                            f"fallback latitude/longitude is configured in Settings.")
 
     obs_time = parse_alpaca_datetime(utc_raw)
     if obs_time is None:
@@ -119,6 +131,7 @@ def slew_and_center(state, target_ra_hours, target_dec_deg, camera_number,
                      exposure_seconds, tolerance_arcmin, max_iterations,
                      astap_path, plate_solve_timeout=60,
                      min_altitude_deg=20.0, sun_exclusion_deg=30.0,
+                     fallback_lat=None, fallback_lon=None,
                      output_dir=None, progress_cb=None, log=print,
                      abort_event=None):
     """UI-independent. `progress_cb(dict)`, if given, is called after each
@@ -171,7 +184,8 @@ def slew_and_center(state, target_ra_hours, target_dec_deg, camera_number,
                         "message": msg}
 
     ok, reason = check_target_safety(telescope, target_ra_hours, target_dec_deg,
-                                      min_altitude_deg, sun_exclusion_deg)
+                                      min_altitude_deg, sun_exclusion_deg,
+                                      fallback_lat=fallback_lat, fallback_lon=fallback_lon)
     log(f"Safety check: {reason}")
     if not ok:
         emit("rejected", message=reason)
